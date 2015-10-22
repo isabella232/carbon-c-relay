@@ -174,12 +174,21 @@ ch_addnode(ch_ring *ring, server *s)
 		return NULL;
 
 	switch (ring->type) {
+	        case CARBON_ALIAS:
 		case CARBON:
 			for (i = 0; i < ring->hash_replicas; i++) {
+				const char* ip;
+				// CARBON_ALIAS always uses 127.0.0.1 as the source
+				// IP when doing hash operations
+				if (ring->type == CARBON_ALIAS)
+					ip = "127.0.0.1";
+				else
+					ip = server_ip(s);
+
 				/* this format is actually Python's tuple format that is
 				 * used in serialised form as input for the hash */
 				snprintf(buf, sizeof(buf), "('%s', %s%s%s):%d",
-						server_ip(s),
+						ip,
 						instance == NULL ? "" : "'",
 						instance == NULL ? "None" : instance,
 						instance == NULL ? "" : "'",
@@ -278,6 +287,7 @@ ch_get_nodes(
 	int i, j;
 
 	switch (ring->type) {
+	        case CARBON_ALIAS:
 		case CARBON:
 			pos = carbon_hashpos(metric, firstspace);
 			break;

@@ -34,13 +34,14 @@
 
 enum clusttype {
 	BLACKHOLE,  /* /dev/null-like destination */
-	GROUP,      /* pseudo type to create a matching tree */
+	GROUP,	    /* pseudo type to create a matching tree */
 	FORWARD,
 	FILELOG,    /* like forward, write metric to file */
 	FILELOGIP,  /* like forward, write ip metric to file */
 	CARBON_CH,  /* room for a better/different hash definition */
 	FNV1A_CH,   /* FNV1a-based consistent-hash */
-	ANYOF,      /* FNV1a-based hash, but with backup by others */
+	CARBON_ALIAS_CH, /* Like carbon_ch, but with an alias host:name lookup */
+	ANYOF,	    /* FNV1a-based hash, but with backup by others */
 	FAILOVER,   /* ordered attempt delivery list */
 	AGGREGATION,
 	REWRITE
@@ -315,12 +316,17 @@ router_readconfig(cluster **clret, route **rret,
 			for (; *p != '\0' && isspace(*p); p++)
 				;
 			if ((strncmp(p, "carbon_ch", 9) == 0 && isspace(*(p + 9))) ||
+			    (strncmp(p, "aliasc_ch", 9) == 0 && isspace(*(p + 9))) ||
 					(strncmp(p, "fnv1a_ch", 8) == 0 && isspace(*(p + 8))))
 			{
 				int replcnt = 1;
-				enum clusttype chtype = *p == 'c' ? CARBON_CH : FNV1A_CH;
 
-				p += chtype == CARBON_CH ? 10 : 9;
+				enum clusttype chtype;
+				if (*p == 'c') { chtype = CARBON_CH; p += 10; }
+				else if (*p == 'f') { chtype = FNV1A_CH; p += 9; }
+				else if (*p == 'a') { chtype = CARBON_ALIAS_CH; p += 10; }
+				else { logerr("invalid hash type detected?"); return 0; }
+
 				for (; *p != '\0' && isspace(*p); p++)
 					;
 				if (strncmp(p, "replication", 11) == 0 && isspace(*(p + 11))) {
@@ -352,8 +358,13 @@ router_readconfig(cluster **clret, route **rret,
 				cl->type = chtype;
 				cl->members.ch = malloc(sizeof(chashring));
 				cl->members.ch->repl_factor = (unsigned char)replcnt;
-				cl->members.ch->ring =
-					ch_new(chtype == CARBON_CH ? CARBON : FNV1a);
+				if (chtype == CARBON_CH) {
+					cl->members.ch->ring = ch_new(CARBON);
+				} else if (chtype == CARBON_ALIAS_CH) {
+					cl->members.ch->ring = ch_new(CARBON_ALIAS);
+				} else if (chtype == FNV1A_CH) {
+					cl->members.ch->ring = ch_new(FNV1a);
+				}
 			} else if (strncmp(p, "forward", 7) == 0 && isspace(*(p + 7))) {
 				p += 8;
 
@@ -460,7 +471,7 @@ router_readconfig(cluster **clret, route **rret,
 				termchr = *p;
 				*p = '\0';
 
-				if (cl->type == CARBON_CH || cl->type == FNV1A_CH) {
+				if (cl->type == CARBON_CH || cl->type == FNV1A_CH || cl->type == CARBON_ALIAS_CH) {
 					if (inst != NULL) {
 						*inst = '\0';
 						p = inst++;
@@ -606,7 +617,7 @@ router_readconfig(cluster **clret, route **rret,
 						return 0;
 					}
 
-					if (cl->type == CARBON_CH || cl->type == FNV1A_CH) {
+					if (cl->type == CARBON_CH || cl->type == FNV1A_CH || cl->type == CARBON_ALIAS_CH) {
 						if (w == NULL) {
 							cl->members.ch->servers = w =
 								malloc(sizeof(servers));
@@ -621,7 +632,7 @@ router_readconfig(cluster **clret, route **rret,
 							return 0;
 						}
 						w->next = NULL;
-						if ((cl->type == CARBON_CH || cl->type == FNV1A_CH)
+						if ((cl->type == CARBON_CH || cl->type == CARBON_ALIAS_CH || cl->type == FNV1A_CH)
 								&& inst != NULL)
 							server_set_instance(newserver, inst);
 						w->server = newserver;
@@ -1478,7 +1489,7 @@ router_getservers(cluster *clusters)
 		} else if (c->type == ANYOF || c->type == FAILOVER) {
 			for (s = c->members.anyof->list; s != NULL; s = s->next)
 				add_server(s->server);
-		} else if (c->type == CARBON_CH || c->type == FNV1A_CH) {
+		} else if (c->type == CARBON_CH || c->type == FNV1A_CH || c->type == CARBON_ALIAS_CH) {
 			for (s = c->members.ch->servers; s != NULL; s = s->next)
 				add_server(s->server);
 		}
@@ -1522,9 +1533,16 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 			for (s = c->members.anyof->list; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s\n",
 						server_ip(s->server), server_port(s->server), PPROTO);
-		} else if (c->type == CARBON_CH || c->type == FNV1A_CH) {
-			fprintf(f, "    %s_ch replication %d\n",
-					c->type == CARBON_CH ? "carbon" : "fnv1a",
+		} else if (c->type == CARBON_CH || c->type == FNV1A_CH || c->type == CARBON_ALIAS_CH) {
+		        char* type;
+			if (c->type == CARBON_CH)
+				type = "carbon";
+			else if (c->type == CARBON_ALIAS_CH)
+				type = "aliasc";
+			else
+				type = "fnv1a";
+			fprintf(f, "	%s_ch replication %d\n",
+				        type,
 					c->members.ch->repl_factor);
 			for (s = c->members.ch->servers; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s%s%s\n",
@@ -1628,6 +1646,7 @@ router_free(cluster *clusters, route *routes)
 
 	while (clusters != NULL) {
 		switch (clusters->type) {
+			case CARBON_ALIAS_CH:
 			case CARBON_CH:
 			case FNV1A_CH:
 				assert(clusters->members.ch != NULL);
@@ -1964,6 +1983,7 @@ router_route_intern(
 					ret[(*curlen)++].metric = strdup(metric);
 					*blackholed = 0;
 				}	break;
+			        case CARBON_ALIAS_CH:
 				case CARBON_CH:
 				case FNV1A_CH: {
 					/* let the ring(bearer) decide */
@@ -2187,6 +2207,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 								server_ip(s->server), server_port(s->server));
 				}	break;
 				case CARBON_CH:
+			        case CARBON_ALIAS_CH:
 				case FNV1A_CH: {
 					destination dst[CONN_DESTS_SIZE];
 					int i;
