@@ -34,11 +34,12 @@
 
 enum clusttype {
 	BLACKHOLE,  /* /dev/null-like destination */
-	GROUP,	    /* pseudo type to create a matching tree */
+	GROUP,      /* pseudo type to create a matching tree */
+	AGGRSTUB,   /* pseudo type to have stub matches for aggregation returns */
 	FORWARD,
 	FILELOG,    /* like forward, write metric to file */
 	FILELOGIP,  /* like forward, write ip metric to file */
-	CARBON_CH,  /* room for a better/different hash definition */
+	CARBON_CH,  /* original carbon-relay.py consistent-hash */
 	FNV1A_CH,   /* FNV1a-based consistent-hash */
 	CARBON_ALIAS_CH, /* Like carbon_ch, but with an alias host:name lookup */
 	ANYOF,	    /* FNV1a-based hash, but with backup by others */
@@ -78,12 +79,17 @@ struct _cluster {
 	struct _cluster *next;
 };
 
+typedef struct _destinations {
+	cluster *cl;
+	struct _destinations *next;
+} destinations;
+
 struct _route {
 	char *pattern;    /* original regex input, used for printing only */
 	regex_t rule;     /* regex on metric, only if type == REGEX */
 	size_t nmatch;    /* number of match groups */
 	char *strmatch;   /* string to search for if type not REGEX or MATCHALL */
-	cluster *dest;    /* where matches should go */
+	destinations *dests; /* where matches should go */
 	char stop:1;      /* whether to continue matching rules after this one */
 	enum {
 		MATCHALL,     /* the '*', don't do anything, just match everything */
@@ -217,8 +223,9 @@ determine_if_regex(route *r, char *pat, int flags)
  *     log [ip]
  *         (/path/to/file ...)
  *     ;
- * match (* | regex)
- *     send to (cluster | blackhole)
+ * match
+ *         (* | regex[ regex ...])
+ *     send to (cluster ... | blackhole)
  *     [stop]
  *     ;
  * rewrite (regex)
@@ -232,6 +239,8 @@ determine_if_regex(route *r, char *pat, int flags)
  *     compute (sum | count | max | min | average) write to
  *         (metric)
  *     [compute ...]
+ *     [send to (cluster ...)]
+ *     [stop]
  *     ;
  *
  * Comments start with a #-char.
@@ -717,119 +726,165 @@ router_readconfig(cluster **clret, route **rret,
 			char *dest;
 			char stop = -1;
 			cluster *w;
+			route *m = NULL;
+			destinations *d = NULL;
+			destinations *dw = NULL;
+
+#define FREE_R \
+			{ \
+				route *lm; \
+				do { \
+					lm = m->next; \
+					free(m); \
+				} while (m != r && (m = lm) != NULL); \
+			}
+#define FREE_D \
+			{ \
+				destinations *ld; \
+				while (dw != NULL) { \
+					ld = dw->next; \
+					free(dw); \
+					dw = ld; \
+				} \
+			}
 
 			p += 6;
 			for (; *p != '\0' && isspace(*p); p++)
 				;
-			pat = p;
-			for (; *p != '\0' && !isspace(*p); p++)
-				;
-			if (*p == '\0') {
-				logerr("unexpected end of file after 'match'\n");
-				free(buf);
-				return 0;
-			}
-			*p++ = '\0';
-			for (; *p != '\0' && isspace(*p); p++)
-				;
-			if (strncmp(p, "send", 4) != 0 || !isspace(*(p + 4))) {
-				logerr("expected 'send to' after match %s\n", pat);
-				free(buf);
-				return 0;
-			}
+
+			do {
+				pat = p;
+				for (; *p != '\0' && !isspace(*p); p++)
+					;
+				if (*p == '\0') {
+					logerr("unexpected end of file after 'match'\n");
+					FREE_R;
+					free(buf);
+					return 0;
+				}
+				*p++ = '\0';
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+
+				if (r == NULL) {
+					topr = r = malloc(sizeof(route));
+				} else {
+					r = r->next = malloc(sizeof(route));
+				}
+				if (m == NULL)
+					m = r;
+				if (strcmp(pat, "*") == 0) {
+					r->pattern = NULL;
+					r->strmatch = NULL;
+					r->matchtype = MATCHALL;
+				} else {
+					int err = determine_if_regex(r, pat,
+							REG_EXTENDED | REG_NOSUB);
+					if (err != 0) {
+						char ebuf[512];
+						regerror(err, &r->rule, ebuf, sizeof(ebuf));
+						logerr("invalid expression '%s' for match: %s\n",
+								pat, ebuf);
+						FREE_R;
+						free(buf);
+						return 0;
+					}
+				}
+				r->next = NULL;
+			} while (strncmp(p, "send", 4) != 0 || !isspace(*(p + 4)));
 			p += 5;
 			for (; *p != '\0' && isspace(*p); p++)
 				;
 			if (strncmp(p, "to", 2) != 0 || !isspace(*(p + 2))) {
 				logerr("expected 'send to' after match %s\n", pat);
+				FREE_R;
 				free(buf);
 				return 0;
 			}
 			p += 3;
 			for (; *p != '\0' && isspace(*p); p++)
 				;
-			dest = p;
-			for (; *p != '\0' && !isspace(*p) && *p != ';'; p++)
-				;
+			do {
+				char save;
+				dest = p;
+				for (; *p != '\0' && !isspace(*p) && *p != ';'; p++)
+					;
+				if (*p == '\0')
+					break;
+				save = *p;
+				*p = '\0';
+
+				/* lookup dest */
+				for (w = topcl; w != NULL; w = w->next) {
+					if (w->type != GROUP &&
+							w->type != AGGRSTUB &&
+							w->type != AGGREGATION &&
+							w->type != REWRITE &&
+							strcmp(w->name, dest) == 0)
+						break;
+				}
+				if (w == NULL) {
+					logerr("no such cluster '%s' for 'match %s'\n", dest, pat);
+					FREE_R;
+					FREE_D;
+					free(buf);
+					return 0;
+				}
+
+				if (dw == NULL) {
+					dw = d = malloc(sizeof(destinations));
+				} else {
+					d = d->next = malloc(sizeof(destinations));
+				}
+				if (d == NULL) {
+					logerr("out of memory allocating new destination '%s' "
+							"for 'match %s'\n", dest, pat);
+					FREE_R;
+					FREE_D;
+					free(buf);
+					return 0;
+				}
+				d->cl = w;
+				d->next = NULL;
+
+				*p = save;
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+			} while (*p != ';' &&
+					!(strncmp(p, "stop", 4) == 0 &&
+						(isspace(*(p + 4)) || *(p + 4) == ';')));
+
 			if (*p == '\0') {
 				logerr("unexpected end of file after 'send to %s'\n",
 						dest);
+				FREE_R;
+				FREE_D;
 				free(buf);
 				return 0;
 			} else if (*p == ';') {
-				*p++ = '\0';
 				stop = 0;
-			} else {
-				*p++ = '\0';
-			}
-			if (stop == -1) {
-				/* look for either ';' or 'stop' followed by ';' */
-				for (; *p != '\0' && isspace(*p); p++)
-					;
-				if (*p == ';') {
-					p++;
-					stop = 0;
-				} else if (strncmp(p, "stop", 4) == 0 &&
-						(isspace(*(p + 4)) || *(p + 4) == ';'))
-				{
-					p += 4;
-					if (*p != ';') {
-						for (; *p != '\0' && isspace(*p); p++)
-							;
-						if (*p != ';') {
-							logerr("expected ';' after stop for "
-									"match %s\n", pat);
-							free(buf);
-							return 0;
-						}
-					}
-					p++;
-					stop = 1;
-				} else {
-					logerr("expected 'stop' and/or ';' after '%s' "
-							"for match %s\n", dest, pat);
-					free(buf);
-					return 0;
-				}
+			} else { /* due to strncmp above, this must be stop */
+				p += 4;
+				stop = 1;
 			}
 
-			/* lookup dest */
-			for (w = topcl; w != NULL; w = w->next) {
-				if (w->type != GROUP &&
-						w->type != AGGREGATION &&
-						w->type != REWRITE &&
-						strcmp(w->name, dest) == 0)
-					break;
-			}
-			if (w == NULL) {
-				logerr("no such cluster '%s' for 'match %s'\n", dest, pat);
+			/* find the closing ';' */
+			for (; *p != '\0' && isspace(*p); p++)
+				;
+			if (*p != ';') {
+				logerr("expected ';' after match %s\n", pat);
+				FREE_R;
+				FREE_D;
 				free(buf);
 				return 0;
 			}
-			if (r == NULL) {
-				topr = r = malloc(sizeof(route));
-			} else {
-				r = r->next = malloc(sizeof(route));
-			}
-			r->dest = w;
-			if (strcmp(pat, "*") == 0) {
-				r->pattern = NULL;
-				r->strmatch = NULL;
-				r->matchtype = MATCHALL;
-			} else {
-				int err = determine_if_regex(r, pat, REG_EXTENDED | REG_NOSUB);
-				if (err != 0) {
-					char ebuf[512];
-					regerror(err, &r->rule, ebuf, sizeof(ebuf));
-					logerr("invalid expression '%s' for match: %s\n",
-							pat, ebuf);
-					free(r);
-					free(buf);
-					return 0;
-				}
-			}
-			r->stop = w->type == BLACKHOLE ? 1 : stop;
-			r->next = NULL;
+			p++;
+
+			/* fill in the destinations for all the routes */
+			do {
+				m->dests = dw;
+				m->stop = w->type == BLACKHOLE ? 1 : stop;
+			} while (m != r && (m = m->next) != NULL);
 
 			if (matchcatchallfound) {
 				logerr("warning: match %s will never be matched "
@@ -848,6 +903,10 @@ router_readconfig(cluster **clret, route **rret,
 			int err;
 			int intv;
 			int exp;
+			char stop = 0;
+			route *m = NULL;
+			destinations *d = NULL;
+			destinations *dw = NULL;
 
 			p += 10;
 			for (; *p != '\0' && isspace(*p); p++)
@@ -876,18 +935,19 @@ router_readconfig(cluster **clret, route **rret,
 				} else {
 					r = r->next = malloc(sizeof(route));
 				}
+				if (m == NULL)
+					m = r;
 				err = determine_if_regex(r, pat, REG_EXTENDED);
 				if (err != 0) {
 					char ebuf[512];
 					regerror(err, &r->rule, ebuf, sizeof(ebuf));
 					logerr("invalid expression '%s' "
 							"for aggregation: %s\n", pat, ebuf);
-					free(r);
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
-				r->dest = w;
-				r->stop = 0;
 				r->next = NULL;
 			} while (strncmp(p, "every", 5) != 0 || !isspace(*(p + 5)));
 			p += 6;
@@ -898,12 +958,16 @@ router_readconfig(cluster **clret, route **rret,
 				;
 			if (*p == '\0') {
 				logerr("unexpected end of file after 'every %s'\n", num);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
 			if (!isspace(*p)) {
 				logerr("unexpected character '%c', "
 						"expected number after 'every'\n", *p);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -912,6 +976,8 @@ router_readconfig(cluster **clret, route **rret,
 				;
 			if (strncmp(p, "seconds", 7) != 0 || !isspace(*(p + 7))) {
 				logerr("expected 'seconds' after 'every %s'\n", num);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -919,6 +985,8 @@ router_readconfig(cluster **clret, route **rret,
 			intv = atoi(num);
 			if (intv == 0) {
 				logerr("interval must be non-zero\n");
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -927,6 +995,8 @@ router_readconfig(cluster **clret, route **rret,
 			if (strncmp(p, "expire", 6) != 0 || !isspace(*(p + 6))) {
 				logerr("expected 'expire after' after 'every %s seconds\n",
 						num);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -935,6 +1005,8 @@ router_readconfig(cluster **clret, route **rret,
 				;
 			if (strncmp(p, "after", 5) != 0 || !isspace(*(p + 5))) {
 				logerr("expected 'after' after 'expire'\n");
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -947,12 +1019,16 @@ router_readconfig(cluster **clret, route **rret,
 			if (*p == '\0') {
 				logerr("unexpected end of file after 'expire after %s'\n",
 						num);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
 			if (!isspace(*p)) {
 				logerr("unexpected character '%c', "
 						"expected number after 'expire after'\n", *p);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -961,6 +1037,8 @@ router_readconfig(cluster **clret, route **rret,
 				;
 			if (strncmp(p, "seconds", 7) != 0 || !isspace(*(p + 7))) {
 				logerr("expected 'seconds' after 'expire after %s'\n", num);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -968,12 +1046,16 @@ router_readconfig(cluster **clret, route **rret,
 			exp = atoi(num);
 			if (exp == 0) {
 				logerr("expire must be non-zero\n");
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
 			if (exp < intv) {
 				logerr("expire (%d) must be greater than interval (%d)\n",
 						exp, intv);
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
@@ -987,6 +1069,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (strncmp(p, "at", 2) != 0 || !isspace(*(p + 2))) {
 					logerr("expected 'at' after 'timestamp'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1005,6 +1089,8 @@ router_readconfig(cluster **clret, route **rret,
 				} else {
 					logerr("expected 'start', 'middle' or 'end' "
 							"after 'timestamp at'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1012,6 +1098,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (strncmp(p, "of", 2) != 0 || !isspace(*(p + 2))) {
 					logerr("expected 'of' after 'timestamp at ...'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1020,6 +1108,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (strncmp(p, "bucket", 6) != 0 || !isspace(*(p + 6))) {
 					logerr("expected 'bucket' after 'timestamp at ... of'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1031,12 +1121,16 @@ router_readconfig(cluster **clret, route **rret,
 			w->members.aggregation = aggregator_new(intv, exp, tswhen);
 			if (w->members.aggregation == NULL) {
 				logerr("out of memory while allocating new aggregator\n");
+				FREE_R;
+				free(w);
 				free(buf);
 				return 0;
 			}
 			do {
 				if (strncmp(p, "compute", 7) != 0 || !isspace(*(p + 7))) {
-					logerr("expected 'compute' at %s'\n", p);
+					logerr("expected 'compute' at: %.20s\n", p);
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1046,6 +1140,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (*p == '\0') {
 					logerr("unexpected end of file after 'compute'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1055,6 +1151,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (strncmp(p, "write", 5) != 0 || !isspace(*(p + 5))) {
 					logerr("expected 'write to' after 'compute %s'\n", pat);
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1063,6 +1161,8 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (strncmp(p, "to", 2) != 0 || !isspace(*(p + 2))) {
 					logerr("expected 'write to' after 'compute %s'\n", pat);
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
@@ -1074,27 +1174,174 @@ router_readconfig(cluster **clret, route **rret,
 					;
 				if (*p == '\0') {
 					logerr("unexpected end of file after 'write to'\n");
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
-				*p++ = '\0';
+			 	*p++ = '\0';
 
 				if (aggregator_add_compute(w->members.aggregation, pat, type) != 0) {
 					logerr("expected sum, count, max, min or average "
 							"after 'compute', got '%s'\n", type);
+					FREE_R;
+					free(w);
 					free(buf);
 					return 0;
 				}
 
 				for (; *p != '\0' && isspace(*p); p++)
 					;
-			} while (*p != ';');
+			} while (*p != ';' &&
+					!(strncmp(p, "send", 4) == 0 && isspace(*(p + 4))) &&
+					!(strncmp(p, "stop", 4) == 0 &&
+						(isspace(*(p + 4)) || *(p + 4) == ';')));
+
+			if (strncmp(p, "send", 4) == 0 && isspace(*(p + 4))) {
+				cluster *cw;
+				p += 5;
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+				if (strncmp(p, "to", 2) != 0 || !isspace(*(p + 2))) {
+					logerr("expected 'to' after 'send' for aggregate\n");
+					free(buf);
+					return 0;
+				}
+				p += 3;
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+				do {
+					char save;
+					char *dest = p;
+					for (; *p != '\0' && !isspace(*p) && *p != ';'; p++)
+						;
+					if (*p == '\0')
+						break;
+					save = *p;
+					*p = '\0';
+
+					/* lookup dest */
+					for (cw = topcl; cw != NULL; cw = cw->next) {
+						if (cw->type != GROUP &&
+								cw->type != AGGRSTUB &&
+								cw->type != AGGREGATION &&
+								cw->type != REWRITE &&
+								strcmp(cw->name, dest) == 0)
+							break;
+					}
+					if (cw == NULL) {
+						logerr("no such cluster '%s' for aggregate\n", dest);
+						FREE_D;
+						FREE_R;
+						free(w);
+						free(buf);
+						return 0;
+					}
+
+					if (dw == NULL) {
+						dw = d = malloc(sizeof(destinations));
+					} else {
+						d = d->next = malloc(sizeof(destinations));
+					}
+					if (d == NULL) {
+						logerr("out of memory allocating new destination '%s' "
+								"for aggregation\n", dest);
+						FREE_D;
+						FREE_R;
+						free(w);
+						free(buf);
+						return 0;
+					}
+					d->cl = cw;
+					d->next = NULL;
+
+					*p = save;
+					for (; *p != '\0' && isspace(*p); p++)
+						;
+				} while (*p != ';' &&
+						!(strncmp(p, "stop", 4) == 0 &&
+							(isspace(*(p + 4)) || *(p + 4) == ';')));
+			}
+
+			if (strncmp(p, "stop", 4) == 0 &&
+					(isspace(*(p + 4)) || *(p + 4) == ';'))
+			{
+				p += 4;
+				stop = 1;
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+			}
+
+			if (*p == '\0') {
+				logerr("unexpected end of file after 'aggregate %s'\n",
+						r->pattern);
+				FREE_D;
+				FREE_R;
+				free(w);
+				free(buf);
+				return 0;
+			}
+			if (*p != ';') {
+				logerr("expected ';' after aggregate %s\n", r->pattern);
+				FREE_D;
+				FREE_R;
+				free(w);
+				free(buf);
+				return 0;
+			}
 			p++;
+
+			/* add cluster to the list of clusters */
+			cl = cl->next = w;
+
+			/* fill in the destinations for all the routes, this is for
+			 * printing and free-ing */
+			do {
+				m->dests = malloc(sizeof(destinations));
+				m->dests->cl = w;
+				m->dests->next = dw;
+				m->stop = stop;
+			} while (m != r && (m = m->next) != NULL);
+
+			if (dw != NULL) {
+				char stubname[48];
+
+				m = malloc(sizeof(route));
+				m->pattern = NULL;
+				m->strmatch = NULL;
+				m->dests = dw;
+				m->stop = 1;
+				m->matchtype = MATCHALL;
+				m->next = NULL;
+
+				/* inject stub route for dests */
+				d = malloc(sizeof(destinations));
+				cl = cl->next = d->cl = malloc(sizeof(cluster));
+				cl->name = NULL;
+				cl->type = AGGRSTUB;
+				cl->members.routes = m;
+				cl->next = NULL;
+				d->next = NULL;
+
+				snprintf(stubname, sizeof(stubname),
+						"_stub_aggregator_%p__", w->members.aggregation);
+				m = malloc(sizeof(route));
+				m->pattern = strdup(stubname);
+				m->strmatch = strdup(stubname);
+				m->dests = d;
+				m->stop = 1;
+				m->matchtype = STARTS_WITH;
+				m->next = topr;
+				/* enforce first match to avoid interference */
+				topr = m;
+
+				aggregator_set_stub(w->members.aggregation, stubname);
+			}
 
 			if (matchcatchallfound) {
 				logerr("warning: aggregate %s will never be matched "
 						"due to preceeding match * ... stop\n",
-						r->pattern == NULL ? "*" : r->pattern);
+						r->pattern);
 			}
 		} else if (strncmp(p, "rewrite", 7) == 0 && isspace(*(p + 7))) {
 			/* rewrite rule */
@@ -1172,7 +1419,9 @@ router_readconfig(cluster **clret, route **rret,
 			cl->members.replacement = strdup(replacement);
 			cl->next = NULL;
 
-			r->dest = cl;
+			r->dests = malloc(sizeof(destinations));
+			r->dests->cl = cl;
+			r->dests->next = NULL;
 			r->stop = 0;
 			r->next = NULL;
 
@@ -1440,11 +1689,13 @@ router_optimise(route **routes)
 			rwalk->pattern = NULL;
 			rwalk->stop = 0;
 			rwalk->matchtype = CONTAINS;
-			rwalk->dest = malloc(sizeof(cluster));
-			rwalk->dest->name = bwalk->pattern;
-			rwalk->dest->type = GROUP;
-			rwalk->dest->members.routes = bwalk->firstroute;
-			rwalk->dest->next = NULL;
+			rwalk->dests = malloc(sizeof(destinations));
+			rwalk->dests->cl = malloc(sizeof(cluster));
+			rwalk->dests->cl->name = bwalk->pattern;
+			rwalk->dests->cl->type = GROUP;
+			rwalk->dests->cl->members.routes = bwalk->firstroute;
+			rwalk->dests->cl->next = NULL;
+			rwalk->dests->next = NULL;
 			rwalk->next = NULL;
 			blast = bwalk->next;
 			free(bwalk);
@@ -1515,7 +1766,9 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 	server_ctype(s->server) == CON_UDP ? " proto udp" : ""
 
 	for (c = clusters; c != NULL; c = c->next) {
-		if (c->type == BLACKHOLE || c->type == REWRITE)
+		if (c->type == BLACKHOLE || c->type == REWRITE ||
+				c->type == GROUP || c->type == AGGREGATION ||
+				c->type == AGGRSTUB)
 			continue;
 		fprintf(f, "cluster %s\n", c->name);
 		if (c->type == FORWARD) {
@@ -1561,18 +1814,31 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 	}
 	fprintf(f, "\n");
 	for (r = routes; r != NULL; r = r->next) {
-		if (r->dest->type == AGGREGATION) {
-			cluster *aggr = r->dest;
+		if (r->dests->cl->type == AGGREGATION) {
+			cluster *aggr = r->dests->cl;
 			struct _aggr_computes *ac;
+			char stubname[48];
 
 			if (!(mode & 1))
 				continue;
 
-			fprintf(f, "aggregate\n");
-			do {
-				fprintf(f, "        %s\n", r->pattern);
-			} while (r->next != NULL && r->next->dest == aggr
-					&& (r = r->next) != NULL);
+			if (mode & 2 || r->dests->next == NULL) {
+				stubname[0] = '\0';
+			} else {
+				snprintf(stubname, sizeof(stubname),
+						"_stub_aggregator_%p__", aggr->members.aggregation);
+			}
+
+			fprintf(f, "aggregate");
+			if (r->next == NULL || r->next->dests->cl != aggr) {
+				fprintf(f, " %s\n", r->pattern);
+			} else {
+				fprintf(f, "\n");
+				do {
+					fprintf(f, "        %s\n", r->pattern);
+				} while (r->next != NULL && r->next->dests->cl == aggr
+						&& (r = r->next) != NULL);
+			}
 			fprintf(f, "    every %u seconds\n"
 					"    expire after %u seconds\n"
 					"    timestamp at %s of bucket\n",
@@ -1587,32 +1853,76 @@ router_printconfig(FILE *f, char mode, cluster *clusters, route *routes)
 						"        %s\n",
 						ac->type == SUM ? "sum" : ac->type == CNT ? "count" :
 						ac->type == MAX ? "max" : ac->type == MIN ? "min" :
-						ac->type == AVG ? "average" : "<unknown>", ac->metric);
-			fprintf(f, "    ;\n");
-		} else if (r->dest->type == REWRITE) {
+						ac->type == AVG ? "average" : "<unknown>",
+						ac->metric + strlen(stubname));
+			if (r->dests->next != NULL) {
+				destinations *dn = r->dests->next;
+				fprintf(f, "    send to");
+				if (dn->next == NULL) {
+					fprintf(f, " %s\n", dn->cl->name);
+				} else {
+					for (; dn != NULL; dn = dn->next)
+						fprintf(f, "\n        %s", dn->cl->name);
+					fprintf(f, "\n");
+				}
+			}
+			fprintf(f, "%s    ;\n", r->stop ? "    stop\n" : "");
+		} else if (r->dests->cl->type == REWRITE) {
 			fprintf(f, "rewrite %s\n    into %s\n    ;\n",
-					r->pattern, r->dest->members.replacement);
-		} else if (r->dest->type == GROUP) {
+					r->pattern, r->dests->cl->members.replacement);
+		} else if (r->dests->cl->type == GROUP) {
 			size_t cnt = 0;
 			route *rwalk;
 			char blockname[64];
 			char *b = &blockname[sizeof(blockname) - 1];
 			char *p;
 			
-			for (rwalk = r->dest->members.routes; rwalk != NULL; rwalk = rwalk->next)
+			for (rwalk = r->dests->cl->members.routes; rwalk != NULL; rwalk = rwalk->next)
 				cnt++;
 			/* reverse the name, to make it human consumable */
 			*b-- ='\0';
-			for (p = r->dest->name; *p != '\0' && b > blockname; p++)
+			for (p = r->dests->cl->name; *p != '\0' && b > blockname; p++)
 				*b-- = *p;
 			fprintf(f, "# common pattern group '%s' "
 					"contains %zd aggregations/matches\n",
 					++b, cnt);
+		} else if (r->dests->cl->type == AGGRSTUB) {
+			if (mode & 2) {
+				fprintf(f, "# stub match for aggregate rule with send to\n");
+				fprintf(f, "match ^%s\n    send to", r->pattern);
+				if (r->dests->cl->members.routes->dests->next == NULL) {
+					fprintf(f, " %s",
+							r->dests->cl->members.routes->dests->cl->name);
+				} else {
+					destinations *d = r->dests->cl->members.routes->dests;
+					for (; d != NULL; d = d->next)
+						fprintf(f, "\n        %s", d->cl->name);
+				}
+				fprintf(f, "%s\n    ;\n", r->stop ? "\n    stop" : "");
+			}
 		} else {
-			fprintf(f, "match %s\n    send to %s%s\n    ;\n",
-					r->matchtype == MATCHALL ? "*" : r->pattern,
-					r->dest->name,
-					r->stop ? "\n    stop" : "");
+			route *or = r;
+			fprintf(f, "match");
+			if (r->next == NULL || r->next->dests != or->dests) {
+				fprintf(f, " %s\n", 
+						r->matchtype == MATCHALL ? "*" : r->pattern);
+			} else {
+				fprintf(f, "\n");
+				do {
+					fprintf(f, "        %s\n",
+							r->matchtype == MATCHALL ? "*" : r->pattern);
+				} while (r->next != NULL && r->next->dests == or->dests
+						&& (r = r->next) != NULL);
+			}
+			fprintf(f, "    send to");
+			if (or->dests->next == NULL) {
+				fprintf(f, " %s", or->dests->cl->name);
+			} else {
+				destinations *d;
+				for (d = or->dests; d != NULL; d = d->next)
+					fprintf(f, "\n        %s", d->cl->name);
+			}
+			fprintf(f, "\n%s    ;\n", or->stop ? "    stop\n" : "");
 		}
 	}
 	fflush(f);
@@ -1627,17 +1937,32 @@ router_free(cluster *clusters, route *routes)
 	cluster *c;
 	route *r;
 	servers *s;
+	destinations *d;
 
 	while (routes != NULL) {
-		if (routes->dest->type == GROUP)
-			router_free(NULL, routes->dest->members.routes);
-
 		if (routes->pattern)
 			free(routes->pattern);
 		if (routes->strmatch)
 			free(routes->strmatch);
 		if (routes->matchtype == REGEX)
 			regfree(&routes->rule);
+
+		if (routes->next == NULL || routes->next->dests != routes->dests) {
+			while (routes->dests != NULL) {
+				if (routes->dests->cl->type == GROUP ||
+						routes->dests->cl->type == AGGRSTUB)
+					router_free(NULL, routes->dests->cl->members.routes);
+
+				/* avoid freeing pointer also in use by stub */
+				if (routes->dests->cl->type == AGGREGATION) {
+					d = NULL;
+				} else {
+					d = routes->dests->next;
+				}
+				free(routes->dests);
+				routes->dests = d;
+			}
+		}
 
 		r = routes->next;
 		free(routes);
@@ -1678,6 +2003,7 @@ router_free(cluster *clusters, route *routes)
 					free(clusters->members.anyof->servers);
 				break;
 			case GROUP:
+			case AGGRSTUB:
 				/* handled at the routes above */
 				break;
 			case AGGREGATION:
@@ -1871,6 +2197,7 @@ router_route_intern(
 		const route *r)
 {
 	const route *w;
+	destinations *d;
 	char stop = 0;
 	const char *p;
 	const char *q = NULL;  /* pacify compiler, won't happen in reality */
@@ -1889,14 +2216,14 @@ router_route_intern(
 
 
 	for (w = r; w != NULL && keep_running; w = w->next) {
-		if (w->dest->type == GROUP) {
+		if (w->dests->cl->type == GROUP) {
 			/* strrstr doesn't exist, grrr
 			 * therefore the pattern in the group is stored in reverse,
 			 * such that we can start matching the tail easily without
 			 * having to calculate the end of the pattern string all the
 			 * time */
 			for (p = firstspace - 1; p >= metric; p--) {
-				for (q = w->dest->name, t = p; *q != '\0' && t >= metric; q++, t--) {
+				for (q = w->dests->cl->name, t = p; *q != '\0' && t >= metric; q++, t--) {
 					if (*q != *t)
 						break;
 				}
@@ -1914,121 +2241,141 @@ router_route_intern(
 						srcaddr,
 						metric,
 						firstspace,
-						w->dest->members.routes);
+						w->dests->cl->members.routes);
 		} else if (router_metric_matches(w, metric, firstspace, pmatch)) {
 			stop = w->stop;
 			/* rule matches, send to destination(s) */
-			switch (w->dest->type) {
-				case BLACKHOLE:
-					break;
-				case FILELOGIP: {
-					servers *s;
-					snprintf(newmetric, sizeof(newmetric), "%s %s",
-							srcaddr, metric);
-					for (s = w->dest->members.forward; s != NULL; s = s->next)
-					{
+			for (d = w->dests; d != NULL; d = d->next) {
+				switch (d->cl->type) {
+					case BLACKHOLE:
+						break;
+					case FILELOGIP: {
+						servers *s;
+						snprintf(newmetric, sizeof(newmetric), "%s %s",
+								srcaddr, metric);
+						for (s = d->cl->members.forward; s != NULL; s = s->next)
+						{
+							failif(retsize, *curlen + 1);
+							ret[*curlen].dest = s->server;
+							ret[(*curlen)++].metric = strdup(newmetric);
+						}
+						*blackholed = 0;
+					}	break;
+					case FILELOG:
+					case FORWARD: {
+						/* simple case, no logic necessary */
+						servers *s;
+						for (s = d->cl->members.forward; s != NULL; s = s->next)
+						{
+							failif(retsize, *curlen + 1);
+							ret[*curlen].dest = s->server;
+							ret[(*curlen)++].metric = strdup(metric);
+						}
+						*blackholed = 0;
+					}	break;
+					case ANYOF: {
+						/* we queue the same metrics at the same server */
+						unsigned int hash = 2166136261UL;  /* FNV1a */
+
+						for (p = metric; p < firstspace; p++)
+							hash = (hash ^ (unsigned int)*p) * 16777619;
+						/* We could use the retry approach here, but since
+						 * our c is very small compared to MAX_INT, the bias
+						 * we introduce for the last few of the range
+						 * (MAX_INT % c) can be considered neglicible given
+						 * the number of occurances of c in the range of
+						 * MAX_INT, therefore we stick with a simple mod. */
+						hash %= d->cl->members.anyof->count;
 						failif(retsize, *curlen + 1);
-						ret[*curlen].dest = s->server;
-						ret[(*curlen)++].metric = strdup(newmetric);
-					}
-					*blackholed = 0;
-				}	break;
-				case FILELOG:
-				case FORWARD: {
-					/* simple case, no logic necessary */
-					servers *s;
-					for (s = w->dest->members.forward; s != NULL; s = s->next)
-					{
-						failif(retsize, *curlen + 1);
-						ret[*curlen].dest = s->server;
+						ret[*curlen].dest =
+							d->cl->members.anyof->servers[hash];
 						ret[(*curlen)++].metric = strdup(metric);
-					}
-					*blackholed = 0;
-				}	break;
-				case ANYOF: {
-					/* we queue the same metrics at the same server */
-					unsigned int hash = 2166136261UL;  /* FNV1a */
+						*blackholed = 0;
+					}	break;
+					case FAILOVER: {
+						/* queue at the first non-failing server */
+						unsigned short i;
+						failif(retsize, *curlen + 1);
+						ret[*curlen].dest = NULL;
+						for (i = 0; i < d->cl->members.anyof->count; i++) {
+							server *s = d->cl->members.anyof->servers[i];
+							if (server_failed(s))
+								continue;
+							ret[*curlen].dest = s;
+							break;
+						}
+						if (ret[*curlen].dest == NULL)
+							/* all failed, take first server */
+							ret[*curlen].dest =
+								d->cl->members.anyof->servers[0];
+						ret[(*curlen)++].metric = strdup(metric);
+						*blackholed = 0;
+					}	break;
+			                case CARBON_ALIAS_CH:
+			                case CARBON_CH:
+					case FNV1A_CH: {
+						/* let the ring(bearer) decide */
+						failif(retsize,
+								*curlen + d->cl->members.ch->repl_factor);
+						ch_get_nodes(
+								&ret[*curlen],
+								d->cl->members.ch->ring,
+								d->cl->members.ch->repl_factor,
+								metric,
+								firstspace);
+						*curlen += d->cl->members.ch->repl_factor;
+						*blackholed = 0;
+					}	break;
+					case AGGREGATION: {
+						/* aggregation rule */
+						aggregator_putmetric(
+								d->cl->members.aggregation,
+								metric,
+								firstspace,
+								w->nmatch, pmatch);
+						*blackholed = 0;
+						/* we need to break out of the inner loop. since
+						 * the rest of dests are meant for the stub, and
+						 * we should certainly not process it now */
+						while (d->next != NULL)
+							d = d->next;
+					}	break;
+					case REWRITE: {
+						/* rewrite metric name */
+						if ((len = router_rewrite_metric(
+									&newmetric, &newfirstspace,
+									metric, firstspace,
+									d->cl->members.replacement,
+									w->nmatch, pmatch)) == 0)
+						{
+							logerr("router_route: failed to rewrite "
+									"metric: newmetric size too small to hold "
+									"replacement (%s -> %s)\n",
+									metric, d->cl->members.replacement);
+							break;
+						};
 
-					for (p = metric; p < firstspace; p++)
-						hash = (hash ^ (unsigned int)*p) * 16777619;
-					/* We could use the retry approach here, but since
-					 * our c is very small compared to MAX_INT, the bias
-					 * we introduce for the last few of the range
-					 * (MAX_INT % c) can be considered neglicible given
-					 * the number of occurances of c in the range of
-					 * MAX_INT, therefore we stick with a simple mod. */
-					hash %= w->dest->members.anyof->count;
-					failif(retsize, *curlen + 1);
-					ret[*curlen].dest =
-						w->dest->members.anyof->servers[hash];
-					ret[(*curlen)++].metric = strdup(metric);
-					*blackholed = 0;
-				}	break;
-				case FAILOVER: {
-					/* queue at the first non-failing server */
-					unsigned short i;
-
-					failif(retsize, *curlen + 1);
-					ret[*curlen].dest = NULL;
-					for (i = 0; i < w->dest->members.anyof->count; i++) {
-						server *s = w->dest->members.anyof->servers[i];
-						if (server_failed(s))
-							continue;
-						ret[*curlen].dest = s;
-						break;
-					}
-					if (ret[*curlen].dest == NULL)
-						/* all failed, take first server */
-						ret[*curlen].dest = w->dest->members.anyof->servers[0];
-					ret[(*curlen)++].metric = strdup(metric);
-					*blackholed = 0;
-				}	break;
-			        case CARBON_ALIAS_CH:
-				case CARBON_CH:
-				case FNV1A_CH: {
-					/* let the ring(bearer) decide */
-					failif(retsize,
-							*curlen + w->dest->members.ch->repl_factor);
-					ch_get_nodes(
-							&ret[*curlen],
-							w->dest->members.ch->ring,
-							w->dest->members.ch->repl_factor,
-							metric,
-							firstspace);
-					*curlen += w->dest->members.ch->repl_factor;
-					*blackholed = 0;
-				}	break;
-				case AGGREGATION: {
-					/* aggregation rule */
-					aggregator_putmetric(
-							w->dest->members.aggregation,
-							metric,
-							firstspace,
-							w->nmatch, pmatch);
-					*blackholed = 0;
-				}	break;
-				case REWRITE: {
-					/* rewrite metric name */
-					if ((len = router_rewrite_metric(
-								&newmetric, &newfirstspace,
-								metric, firstspace,
-								w->dest->members.replacement,
-								w->nmatch, pmatch)) == 0)
-					{
-						logerr("router_route: failed to rewrite "
-								"metric: newmetric size too small to hold "
-								"replacement (%s -> %s)\n",
-								metric, w->dest->members.replacement);
-						break;
-					};
-
-					/* scary! write back the rewritten metric */
-					memcpy(metric, newmetric, len);
-					firstspace = metric + (newfirstspace - newmetric);
-				}	break;
-				case GROUP: {
-					/* this should not happen */
-				}	break;
+						/* scary! write back the rewritten metric */
+						memcpy(metric, newmetric, len);
+						firstspace = metric + (newfirstspace - newmetric);
+					}	break;
+					case AGGRSTUB: {
+						/* strip off the stub pattern, and reroute this
+						 * thing */
+						router_route_intern(
+								blackholed,
+								ret,
+								curlen,
+								retsize,
+								srcaddr,
+								metric + strlen(w->pattern),
+								firstspace + strlen(w->pattern),
+								w->dests->cl->members.routes);
+					}	break;
+					case GROUP: {
+						/* this should not happen */
+					}	break;
+				}
 			}
 
 			/* stop processing further rules if requested */
@@ -2081,18 +2428,18 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 	regmatch_t pmatch[RE_MAX_MATCHES];
 
 	for (w = routes; w != NULL; w = w->next) {
-		if (w->dest->type == GROUP) {
+		if (w->dests->cl->type == GROUP) {
 			/* just recurse, in test mode performance shouldn't be an
 			 * issue at all */
 			gotmatch |= router_test_intern(
 					metric,
 					firstspace,
-					w->dest->members.routes);
+					w->dests->cl->members.routes);
 			if (gotmatch & 2)
 				break;
 		} else if (router_metric_matches(w, metric, firstspace, pmatch)) {
 			gotmatch = 1;
-			switch (w->dest->type) {
+			switch (w->dests->cl->type) {
 				case AGGREGATION:
 					fprintf(stdout, "aggregation\n");
 					break;
@@ -2136,13 +2483,22 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 				}	break;
 			}
 			*firstspace = ' ';
-			switch (w->dest->type) {
+			switch (w->dests->cl->type) {
 				case AGGREGATION: {
 					struct _aggr_computes *ac;
 					char newmetric[METRIC_BUFSIZ];
 					char *newfirstspace = NULL;
+					char stubname[48];
 
-					for (ac = w->dest->members.aggregation->computes; ac != NULL; ac = ac->next)
+					if (mode == DEBUGTEST || w->dests->next == NULL) {
+						stubname[0] = '\0';
+					} else {
+						snprintf(stubname, sizeof(stubname),
+								"_stub_aggregator_%p__",
+								w->dests->cl->members.aggregation);
+					}
+
+					for (ac = w->dests->cl->members.aggregation->computes; ac != NULL; ac = ac->next)
 					{
 						if (w->nmatch == 0 || (len = router_rewrite_metric(
 										&newmetric, &newfirstspace,
@@ -2159,7 +2515,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 								break;
 							}
 							snprintf(newmetric, sizeof(newmetric),
-									"%s", ac->metric);
+									"%s", ac->metric + strlen(stubname));
 						}
 
 						fprintf(stdout, "    %s%s%s%s -> %s\n",
@@ -2180,13 +2536,13 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					if ((len = router_rewrite_metric(
 								&newmetric, &newfirstspace,
 								metric, firstspace,
-								w->dest->members.replacement,
+								w->dests->cl->members.replacement,
 								w->nmatch, pmatch)) == 0)
 					{
 						fprintf(stderr, "router_test: failed to rewrite "
 								"metric: newmetric size too small to hold "
 								"replacement (%s -> %s)\n",
-								metric, w->dest->members.replacement);
+								metric, w->dests->cl->members.replacement);
 						break;
 					};
 
@@ -2195,14 +2551,14 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					firstspace = metric + (newfirstspace - newmetric);
 					*firstspace = '\0';
 					fprintf(stdout, "    into(%s) -> %s\n",
-							w->dest->members.replacement, metric);
+							w->dests->cl->members.replacement, metric);
 					*firstspace = ' ';
 				}	break;
 				case FORWARD: {
 					servers *s;
 
-					fprintf(stdout, "    forward(%s)\n", w->dest->name);
-					for (s = w->dest->members.forward; s != NULL; s = s->next)
+					fprintf(stdout, "    forward(%s)\n", w->dests->cl->name);
+					for (s = w->dests->cl->members.forward; s != NULL; s = s->next)
 						fprintf(stdout, "        %s:%d\n",
 								server_ip(s->server), server_port(s->server));
 				}	break;
@@ -2213,19 +2569,19 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					int i;
 
 					fprintf(stdout, "    %s_ch(%s)\n", 
-							w->dest->type == FNV1A_CH ? "fnv1a" : "carbon",
-							w->dest->name);
+							w->dests->cl->type == FNV1A_CH ? "fnv1a" : "carbon",
+							w->dests->cl->name);
 					if (mode == DEBUGTEST) {
 						fprintf(stdout, "        hash_pos(%d)\n",
-								ch_gethashpos(w->dest->members.ch->ring,
+								ch_gethashpos(w->dests->cl->members.ch->ring,
 									metric, firstspace));
 					}
 					ch_get_nodes(dst,
-							w->dest->members.ch->ring,
-							w->dest->members.ch->repl_factor,
+							w->dests->cl->members.ch->ring,
+							w->dests->cl->members.ch->repl_factor,
 							metric,
 							firstspace);
-					for (i = 0; i < w->dest->members.ch->repl_factor; i++) {
+					for (i = 0; i < w->dests->cl->members.ch->repl_factor; i++) {
 						fprintf(stdout, "        %s:%d\n",
 								server_ip(dst[i].dest),
 								server_port(dst[i].dest));
@@ -2237,22 +2593,22 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					unsigned int hash = 2166136261UL;  /* FNV1a */
 
 					fprintf(stdout, "    %s(%s)\n",
-							w->dest->type == ANYOF ? "any_of" : "failover",
-							w->dest->name);
-					if (w->dest->type == ANYOF) {
+							w->dests->cl->type == ANYOF ? "any_of" : "failover",
+							w->dests->cl->name);
+					if (w->dests->cl->type == ANYOF) {
 						const char *p;
 						for (p = metric; p < firstspace; p++)
 							hash = (hash ^ (unsigned int)*p) * 16777619;
-						hash %= w->dest->members.anyof->count;
+						hash %= w->dests->cl->members.anyof->count;
 					} else {
 						hash = 0;
 					}
 					fprintf(stdout, "        %s:%d\n",
-							server_ip(w->dest->members.anyof->servers[hash]),
-							server_port(w->dest->members.anyof->servers[hash]));
+							server_ip(w->dests->cl->members.anyof->servers[hash]),
+							server_port(w->dests->cl->members.anyof->servers[hash]));
 				}	break;
 				default: {
-					fprintf(stdout, "    cluster(%s)\n", w->dest->name);
+					fprintf(stdout, "    cluster(%s)\n", w->dests->cl->name);
 				}	break;
 			}
 			if (w->stop) {

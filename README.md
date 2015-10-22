@@ -43,7 +43,7 @@ rule sees the metric:
     a single space only, ever)
   - irregular char replacement with underscores (\_), currently
     irregular is defined as not being in [0-9a-zA-Z-_:#], but can be
-	overridden on the command line.
+    overridden on the command line.
 
 The route file syntax is as follows:
 
@@ -58,8 +58,9 @@ cluster <name>
     file
         </path/to/file> ...
     ;
-match <* | <expression>>
-    send to <cluster | blackhole>
+match
+        <* | expression ...>
+    send to <cluster ... | blackhole>
     [stop]
     ;
 rewrite <expression>
@@ -73,6 +74,8 @@ aggregate
     compute <sum | count | max | min | average> write to
         <metric>
     [compute ...]
+    [send to <cluster ...>]
+    [stop]
     ;
 ```
 
@@ -125,16 +128,17 @@ multiple addresses.  Each address returned becomes a cluster destination.
 
 Match rules are the way to direct incoming metrics to one or more
 clusters.  Match rules are processed top to bottom as they are defined
-in the file.  Each match rule can send data to just one cluster.  Since
-match rules "fall through" unless the `stop` keyword is added to the
-match rule, the same match expression can be used to target multiple
-clusters.  This ability allows to replicate metrics, as well as send
-certain metrics to alternative clusters with careful ordering and usage
-of the `stop` keyword.  The special cluster `blackhole` discards any
-metrics sent to it.  This can be useful for weeding out unwanted metrics
-in certain cases.  Because throwing metrics away is pointless if other
-matches would accept the same data, a match with destination the
-blackhole cluster, has an implicit `stop`.
+in the file.  It is possible to define multiple matches in the same
+rule.  Each match rule can send data to one or more clusters.  Since
+match rules "fall through" unless the `stop` keyword is added,
+carefully crafted match expression can be used to target
+multiple clusters or aggregations.  This ability allows to replicate
+metrics, as well as send certain metrics to alternative clusters with
+careful ordering and usage of the `stop` keyword.  The special cluster
+`blackhole` discards any metrics sent to it.  This can be useful for
+weeding out unwanted metrics in certain cases.  Because throwing metrics
+away is pointless if other matches would accept the same data, a match
+with as destination the blackhole cluster, has an implicit `stop`.
 
 Rewrite rules take a regular input to match incoming metrics, and
 transform them into the desired new metric name.  In the replacement,
@@ -171,11 +175,14 @@ aggregation multiple aggregations can be computed.  They can be of the
 same or different aggregation types, but should write to a unique new
 metric.  The metric names can include back references like in rewrite
 expressions, allowing for powerful single aggregation rules that yield
-in many aggregations.  Produced metrics are sent to the relay as if they
-were submitted from the outside, hence match and aggregation rules apply
-to those.  Care should be taken that loops are avoided.  Also, since
-aggregations appear as matches without `stop` keyword, their positioning
-matters in the same way ordering of match statements.
+in many aggregations.  When no `send to` clause is given, produced
+metrics are sent to the relay as if they were submitted from the
+outside, hence match and aggregation rules apply to those.  Care should
+be taken that loops are avoided this way.  For this reason, the use of
+the `send to` clause is encouraged, to direct the output traffic where
+possible.  Like for match rules, it is possible to define multiple
+cluster targets.  Also, like match rules, the `stop` keyword applies to
+control the flow of metrics in the matching process.
 
 
 Examples
@@ -269,10 +276,9 @@ use of the `forward` cluster type, in a more intelligent way:
         send to dc-old
         ;
     match *
-        send to dc-new1
-        ;
-    match *
-        send to dc-new2
+        send to
+            dc-new1
+            dc-new2
         stop
         ;
 
@@ -282,11 +288,15 @@ In this example all incoming metrics are first sent to `dc-old`, then
 of all three clusters, thus replicating to in total 6 destinations.  For
 each cluster the destination members are computed independently.
 Failure of clusters or members does not affect the others, since all
-have individual queues.  The `stop` rule in `dc-new2` match rule is not
-strictly necessary in this example, because there are no more following
-match rules.  However, if the match would target a specific subset, e.g.
-`^sys\.`, and more clusters would be defined, this could be necessary,
-as for instance in the following abbreviated example:
+have individual queues.  The above example could also be written using
+three match rules for each dc, or one match rule for all three dcs.  The
+difference is mainly in performance, the number of times the incoming
+metric has to be matched against an expression.  The `stop` rule in
+`dc-new` match rule is not strictly necessary in this example, because
+there are no more following match rules.  However, if the match would
+target a specific subset, e.g.  `^sys\.`, and more clusters would be
+defined, this could be necessary, as for instance in the following
+abbreviated example:
 
     cluster dc1-sys ... ;
     cluster dc2-sys ... ;
@@ -311,7 +321,9 @@ this metric.  The `blackhole` cluster is suitable for that, when it is
 harder to actually whitelist all wanted metrics.  Consider the
 following:
 
-    match some_legacy$
+    match
+            some_legacy1$
+            some_legacy2$
         send to blackhole
         stop;
 
@@ -371,7 +383,7 @@ aggregation looks like:
             ^sys\.dc2\.somehost-[0-9]+\.somecluster\.mysql\.replication_delay
         every 10 seconds
         expire after 35 seconds
-		timestamp at end of bucket
+        timestamp at end of bucket
         compute sum write to
             mysql.somecluster.total_replication_delay
         compute average write to
@@ -435,6 +447,28 @@ example have both identical values.  Note that with this single
 aggregation rule, both per-cluster, per-host and total aggregations are
 produced.  Obviously, the input metrics define which hosts and clusters
 are produced.
+
+With use of the `send to` clause, aggregations can be made more
+intuitive and less error-prone.  Consider the below example:
+
+    cluster graphite fnv1a_ch ip1 ip2 ip3;
+
+    aggregate ^sys\.somemetric
+        every 60 seconds
+        expire after 75 seconds
+        compute sum write to
+            sys.somemetric
+        send to graphite
+        stop
+        ;
+
+    match * send to graphite;
+
+It sends all incoming metrics to the graphite cluster, except the
+sys.somemetric ones, which it replaces with a sum of all the incoming
+ones.  Without a `stop` in the aggregate, this causes a loop, and
+without the `send to`, the metric name can't be kept its original name,
+for the output now directly goes to the cluster.
 
 
 Performance
