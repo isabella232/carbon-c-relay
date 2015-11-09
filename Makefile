@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-CFLAGS ?= -O2 -Wall
+CFLAGS ?= -O2 -Wall -g3 -fno-omit-frame-pointer
 # if your compiler doesn't support OpenMP, comment out this line, or
 # define OPENMP_FLAGS to be empty
 OPENMP_FLAGS ?= -fopenmp
