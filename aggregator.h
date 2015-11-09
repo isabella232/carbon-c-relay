@@ -33,21 +33,28 @@ typedef struct _aggregator {
 	size_t sent;
 	size_t dropped;
 	struct _aggr_computes {
-		enum _aggr_compute_type { SUM, CNT, MAX, MIN, AVG } type;
+		enum _aggr_compute_type { SUM, CNT, MAX, MIN, AVG,
+		                          MEDN, PCTL, VAR, SDEV } type;
 		const char *metric;   /* name template of metric to produce */
 		struct _aggr_invocations {
 			char *metric;       /* actual name to emit */
 			unsigned int hash;  /* to speed up matching */
 			unsigned short expire;  /* expire + splay */
-			struct _bucket {
+			struct _aggr_bucket {
 				long long int start;
 				size_t cnt;
 				double sum;
 				double max;
 				double min;
+				struct _aggr_bucket_entries {
+					size_t size;
+					double *values;
+				} entries;
 			} *buckets;
 			struct _aggr_invocations *next;
 		} *invocations_ht[1 << AGGR_HT_POW_SIZE];
+		unsigned char entries_needed:1;
+		unsigned char percentile:7;
 		struct _aggr_computes *next;
 	} *computes;
 	pthread_mutex_t bucketlock;
@@ -65,5 +72,8 @@ size_t aggregator_numcomputes(void);
 size_t aggregator_get_received(void);
 size_t aggregator_get_sent(void);
 size_t aggregator_get_dropped(void);
+size_t aggregator_get_received_sub(void);
+size_t aggregator_get_sent_sub(void);
+size_t aggregator_get_dropped_sub(void);
 
 #endif

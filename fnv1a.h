@@ -14,23 +14,13 @@
  * limitations under the License.
  */
 
-
-#ifndef COLLECTOR_H
-#define COLLECTOR_H 1
-
-#include "dispatcher.h"
-#include "router.h"
-#include "server.h"
-#include "relay.h"
-
-extern int collector_interval;
-
-#define timediff(X, Y) \
-	(Y.tv_sec > X.tv_sec ? (Y.tv_sec - X.tv_sec) * 1000 * 1000 + ((Y.tv_usec - X.tv_usec)) : Y.tv_usec - X.tv_usec)
-
-void collector_start(dispatcher **d, cluster *c, server *submission, char cum);
-void collector_stop(void);
-void collector_schedulereload(cluster *c);
-char collector_reloadcomplete(void);
-
-#endif
+#define FNV1A_32_OFFSET   2166136261UL
+#define FNV1A_32_PRIME    16777619
+/**
+ * 32-bits unsigned FNV1a returning into hash, using p to as variable to
+ * walk over metric up to firstspace
+ */
+#define fnv1a_32(hash, p, metric, firstspace) \
+	hash = FNV1A_32_OFFSET; \
+	for (p = metric; p < firstspace; p++) \
+		hash = (hash ^ (unsigned int)*p) * FNV1A_32_PRIME;

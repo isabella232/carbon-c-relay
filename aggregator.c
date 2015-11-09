@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include <regex.h>
 #include <pthread.h>
 #include <assert.h>
@@ -29,10 +30,14 @@
 #include "server.h"
 #include "router.h"
 #include "aggregator.h"
+#include "fnv1a.h"
 
 static pthread_t aggregatorid;
 static aggregator *aggregators = NULL;
 static aggregator *lastaggr = NULL;
+static size_t prevreceived = 0;
+static size_t prevsent = 0;
+static size_t prevdropped = 0;
 static char keep_running = 1;
 
 
@@ -87,6 +92,8 @@ aggregator_add_compute(
 {
 	struct _aggr_computes *ac = s->computes;
 	enum _aggr_compute_type act;
+	char store = 0;
+	int pctl = 0;
 
 	if (strcmp(type, "sum") == 0) {
 		act = SUM;
@@ -98,6 +105,24 @@ aggregator_add_compute(
 		act = MIN;
 	} else if (strcmp(type, "average") == 0 || strcmp(type, "avg") == 0) {
 		act = AVG;
+	} else if (strcmp(type, "median") == 0) {
+		act = MEDN;
+		pctl = 50;
+		store = 1;
+	} else if (strncmp(type, "percentile", strlen("percentile")) == 0) {
+		pctl = atoi(type + strlen("percentile"));
+		if (pctl > 100 || pctl <= 0) {
+			return -1;
+		} else {
+			act = PCTL;
+			store = 1;
+		}
+	} else if (strcmp(type, "variance") == 0) {
+		act = VAR;
+		store = 1;
+	} else if (strcmp(type, "stddev") == 0) {
+		act = SDEV;
+		store = 1;
 	} else {
 		return -1;
 	}
@@ -111,8 +136,10 @@ aggregator_add_compute(
 	}
 
 	ac->type = act;
+	ac->percentile = (unsigned char)pctl;
 	ac->metric = strdup(metric);
 	memset(ac->invocations_ht, 0, sizeof(ac->invocations_ht));
+	ac->entries_needed = store;
 	ac->next = NULL;
 
 	return 0;
@@ -125,7 +152,7 @@ aggregator_set_stub(
 {
 	struct _aggr_computes *ac;
 	char newmetric[METRIC_BUFSIZ];
-	
+
 	for (ac = s->computes; ac != NULL; ac = ac->next) {
 		snprintf(newmetric, sizeof(newmetric), "%s%s", stubname, ac->metric);
 		free((void *)ac->metric);
@@ -152,7 +179,6 @@ aggregator_putmetric(
 	long long int epoch;
 	long long int itime;
 	int slot;
-	struct _bucket *bucket;
 	char newmetric[METRIC_BUFSIZ];
 	char *newfirstspace = NULL;
 	size_t len;
@@ -162,6 +188,8 @@ aggregator_putmetric(
 	unsigned int omhtbucket;
 	struct _aggr_computes *compute;
 	struct _aggr_invocations *invocation;
+	struct _aggr_bucket *bucket;
+	struct _aggr_bucket_entries *entries;
 
 	/* get value */
 	if ((v = strchr(firstspace + 1, ' ')) == NULL) {
@@ -194,9 +222,9 @@ aggregator_putmetric(
 			ometric = newmetric;
 		}
 
-		omhash = 2166136261UL;  /* FNV1a */
+		omhash = FNV1A_32_OFFSET;
 		for (omp = ometric; *omp != '\0'; omp++)
-			omhash = (omhash ^ (unsigned int)*omp) * 16777619;
+			omhash = (omhash ^ (unsigned int)*omp) * FNV1A_32_PRIME;
 
 		omhtbucket =
 			((omhash >> AGGR_HT_POW_SIZE) ^ omhash) &
@@ -239,7 +267,7 @@ aggregator_putmetric(
 
 			/* allocate enough buckets to hold the past + future */
 			invocation->buckets =
-				malloc(sizeof(struct _bucket) * s->bucketcnt);
+				malloc(sizeof(struct _aggr_bucket) * s->bucketcnt);
 			if (invocation->buckets == NULL) {
 				logerr("aggregator: out of memory creating %s from %s",
 						ometric, metric);
@@ -278,22 +306,43 @@ aggregator_putmetric(
 
 		bucket = &invocation->buckets[slot];
 		if (bucket->cnt == 0) {
-			bucket->cnt = 1;
 			bucket->sum = val;
 			bucket->max = val;
 			bucket->min = val;
 		} else {
-			bucket->cnt++;
 			bucket->sum += val;
 			if (bucket->max < val)
 				bucket->max = val;
 			if (bucket->min > val)
 				bucket->min = val;
 		}
+		entries = &bucket->entries;
+		if (compute->entries_needed) {
+			if (bucket->cnt == entries->size) {
+#define E_I_SZ 64
+				double *new = realloc(entries->values, entries->size + E_I_SZ);
+				if (new == NULL) {
+					logerr("aggregator: out of memory creating entry bucket "
+							"(%s from %s)", ometric, metric);
+				} else {
+					entries->values = new;
+					entries->size += E_I_SZ;
+				}
+			}
+			if (bucket->cnt < entries->size)
+				entries->values[bucket->cnt] = val;
+		}
+		bucket->cnt++;
 	}
 	pthread_mutex_unlock(&s->bucketlock);
 
 	return;
+}
+
+static inline int
+cmp_entry(const void *l, const void *r)
+{
+	return *(const double *)l - *(const double *)r;
 }
 
 /**
@@ -307,11 +356,13 @@ aggregator_expire(void *sub)
 {
 	time_t now;
 	aggregator *s;
-	struct _bucket *b;
+	struct _aggr_bucket *b;
 	struct _aggr_computes *c;
 	struct _aggr_invocations *inv;
 	struct _aggr_invocations *lastinv;
+	double *values;
 	int i;
+	unsigned char j;
 	int work;
 	server *submission = (server *)sub;
 	char metric[METRIC_BUFSIZ];
@@ -379,6 +430,43 @@ aggregator_expire(void *sub)
 												inv->metric,
 												b->sum / (double)b->cnt, ts);
 										break;
+									case MEDN:
+										/* median == 50th percentile */
+									case PCTL: {
+										/* nearest rank method */
+										size_t n =
+											(int)(((double)c->percentile/100.0 *
+														(double)b->cnt) + 0.9);
+										values = b->entries.values;
+										/* TODO: lazy approach, in case
+										 * of 1 (first/last) or 2 buckets
+										 * distance we could do a
+										 * forward run picking the max
+										 * entries and returning that
+										 * iso sorting the full array */
+										qsort(values, b->cnt,
+												sizeof(double), cmp_entry);
+										snprintf(metric, sizeof(metric),
+												"%s %f %lld\n",
+												inv->metric,
+												values[n - 1],
+												b->start + s->interval);
+									}	break;
+									case VAR:
+									case SDEV: {
+										double avg = b->sum / (double)b->cnt;
+										double ksum = 0;
+										values = b->entries.values;
+										for (i = 0; i < b->cnt; i++)
+											ksum += pow(values[i] - avg, 2);
+										ksum /= (double)b->cnt;
+										snprintf(metric, sizeof(metric),
+												"%s %f %lld\n",
+												inv->metric,
+												c->type == VAR ? ksum :
+													sqrt(ksum),
+												b->start + s->interval);
+									}	break;
 								}
 								server_send(submission, strdup(metric), 1);
 								s->sent++;
@@ -400,7 +488,6 @@ aggregator_expire(void *sub)
 						}
 
 						if (isempty) {
-							int j;
 							/* see if the remaining buckets are empty too */
 							pthread_mutex_lock(&s->bucketlock);
 							for (j = 0; j < s->bucketcnt; j++) {
@@ -413,6 +500,10 @@ aggregator_expire(void *sub)
 						}
 						if (isempty) {
 							/* free and unlink */
+							if (c->entries_needed)
+								for (j = 0; j < s->bucketcnt; j++)
+									if (inv->buckets[j].entries.values)
+										free(inv->buckets[j].entries.values);
 							free(inv->metric);
 							free(inv->buckets);
 							if (lastinv != NULL) {
@@ -516,6 +607,19 @@ aggregator_get_received(void)
 }
 
 /**
+ * Returns an approximate number of metrics received by all aggregators
+ * since the last call to this function.
+ */
+inline size_t
+aggregator_get_received_sub()
+{
+	size_t d = aggregator_get_received();
+	size_t r = d - prevreceived;
+	prevreceived += d;
+	return r;
+}
+
+/**
  * Returns an approximate number of metrics sent by all aggregators.
  */
 size_t
@@ -528,6 +632,19 @@ aggregator_get_sent(void)
 		totsent += a->sent;
 
 	return totsent;
+}
+
+/**
+ * Returns an approximate number of metrics sent by all aggregators
+ * since the last call to this function.
+ */
+inline size_t
+aggregator_get_sent_sub()
+{
+	size_t d = aggregator_get_sent();
+	size_t r = d - prevsent;
+	prevsent += d;
+	return r;
 }
 
 /**
@@ -545,4 +662,17 @@ aggregator_get_dropped(void)
 		totdropped += a->dropped;
 
 	return totdropped;
+}
+
+/**
+ * Returns an approximate number of metrics dropped by all aggregators
+ * since the last call to this function.
+ */
+inline size_t
+aggregator_get_dropped_sub()
+{
+	size_t d = aggregator_get_dropped();
+	size_t r = d - prevdropped;
+	prevdropped += d;
+	return r;
 }

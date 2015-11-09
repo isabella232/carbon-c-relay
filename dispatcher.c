@@ -60,6 +60,9 @@ struct _dispatcher {
 	size_t metrics;
 	size_t blackholes;
 	size_t ticks;
+	size_t prevmetrics;
+	size_t prevblackholes;
+	size_t prevticks;
 	enum { RUNNING, SLEEPING } state;
 	char keep_running:1;
 	route *routes;
@@ -247,7 +250,7 @@ int
 dispatch_addlistener_udp(int sock)
 {
 	int conn = dispatch_addconnection(sock);
-	
+
 	if (conn == -1)
 		return 1;
 
@@ -328,9 +331,9 @@ dispatch_connection(connection *conn, dispatcher *self)
 	/* try to read more data, if that succeeds, or we still have data
 	 * left in the buffer, try to process the buffer */
 	if (
-			(!conn->needmore && conn->buflen > 0) || 
+			(!conn->needmore && conn->buflen > 0) ||
 			(len = read(conn->sock,
-						conn->buf + conn->buflen, 
+						conn->buf + conn->buflen,
 						(sizeof(conn->buf) - 1) - conn->buflen)) > 0
 	   )
 	{
@@ -483,6 +486,9 @@ dispatch_runner(void *arg)
 	self->metrics = 0;
 	self->blackholes = 0;
 	self->ticks = 0;
+	self->prevmetrics = 0;
+	self->prevblackholes = 0;
+	self->prevticks = 0;
 	self->state = SLEEPING;
 
 	if (self->type == LISTENER) {
@@ -661,12 +667,36 @@ dispatch_get_ticks(dispatcher *self)
 }
 
 /**
+ * Returns the wall-clock time consumed since last call to this
+ * function.
+ */
+inline size_t
+dispatch_get_ticks_sub(dispatcher *self)
+{
+	size_t d = self->ticks - self->prevticks;
+	self->prevticks += d;
+	return d;
+}
+
+/**
  * Returns the number of metrics dispatched since start.
  */
 inline size_t
 dispatch_get_metrics(dispatcher *self)
 {
 	return self->metrics;
+}
+
+/**
+ * Returns the number of metrics dispatched since last call to this
+ * function.
+ */
+inline size_t
+dispatch_get_metrics_sub(dispatcher *self)
+{
+	size_t d = self->metrics - self->prevmetrics;
+	self->prevmetrics += d;
+	return d;
 }
 
 /**
@@ -677,6 +707,18 @@ inline size_t
 dispatch_get_blackholes(dispatcher *self)
 {
 	return self->blackholes;
+}
+
+/**
+ * Returns the number of metrics that were blackholed since last call to
+ * this function.
+ */
+inline size_t
+dispatch_get_blackholes_sub(dispatcher *self)
+{
+	size_t d = self->blackholes - self->prevblackholes;
+	self->prevblackholes += d;
+	return d;
 }
 
 /**
